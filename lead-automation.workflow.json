@@ -1,0 +1,672 @@
+{
+  "name": "AI Lead Automation - Intake, Qualify, CRM, Follow-Up",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "8c343dc0-35b3-47ee-8531-79d2a2e3bc2c",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "n01",
+      "name": "Lead Intake Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -380,
+        300
+      ],
+      "webhookId": "8c343dc0-35b3-47ee-8531-79d2a2e3bc2c"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Accept a raw JSON post or a form-encoded submission and flatten both into\n// one shape, so downstream nodes only handle one field layout.\nconst incoming = $input.first().json;\nconst body = incoming.body ?? incoming;\n\nconst str = (v) => (typeof v === 'string' ? v.trim() : v == null ? '' : String(v).trim());\n\nconst lead = {\n  firstName: str(body.firstName ?? body.first_name ?? body.fname),\n  lastName:  str(body.lastName  ?? body.last_name  ?? body.lname),\n  email:     str(body.email ?? body.email_address).toLowerCase(),\n  phone:     str(body.phone ?? body.phone_number),\n  company:   str(body.company ?? body.organisation ?? body.organization),\n  message:   str(body.message ?? body.notes ?? body.comments),\n  source:    str(body.source) || 'webhook',\n  budget:    str(body.budget),\n  website:   str(body.website),\n};\n\nconst errors = [];\nconst warnings = [];\n\n// Permissive on purpose: catches obvious junk without rejecting valid\n// addresses that a strict RFC pattern would.\nconst EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}$/;\nif (!lead.email) {\n  errors.push('email is required');\n} else if (!EMAIL_RE.test(lead.email)) {\n  errors.push('email is not a valid address');\n}\n\nif (!lead.firstName && !lead.lastName && !lead.company) {\n  errors.push('need at least a first name, last name or company');\n}\n\n// A bad phone number is dropped with a warning rather than failing the lead.\nlet phone = lead.phone.replace(/[^\\d+]/g, '');\nif (phone && !phone.startsWith('+')) {\n  phone = '+' + phone.replace(/^0+/, '');\n}\nif (phone && phone.replace(/\\D/g, '').length < 7) {\n  warnings.push('phone discarded, too short to be a real number');\n  phone = '';\n}\nlead.phone = phone;\n\n// Idempotency key so a retried webhook does not create a second contact.\n// Falls back to the email address when the caller does not supply one.\nconst idempotencyKey = str(body.idempotencyKey ?? body.idempotency_key) || lead.email;\n\nreturn [{\n  json: {\n    valid: errors.length === 0,\n    errors,\n    warnings,\n    idempotencyKey,\n    receivedAt: new Date().toISOString(),\n    lead,\n  },\n}];"
+      },
+      "id": "n02",
+      "name": "Validate & Normalise",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -160,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n03",
+      "name": "Input Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        60,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, errors: $json.errors }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "n04",
+      "name": "Respond: 400 Invalid",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        280,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://services.leadconnectorhq.com/locations/{{ $env.GHL_LOCATION_ID }}/customFields",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n05",
+      "name": "GHL: Read Custom Fields",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        280,
+        200
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GHL_PIT",
+          "name": "GHL Private Integration Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Resolve custom field names to GHL ids at runtime. Hardcoded ids would tie\n// the export to one sub-account; this costs one API call per run instead.\nconst upstream = $('Validate & Normalise').first().json;\nconst fields = $input.first().json.customFields ?? [];\n\nconst byName = {};\nfor (const f of fields) {\n  if (f && f.name) byName[f.name.trim().toLowerCase()] = f.id;\n}\n\nconst WANTED = {\n  score:     'ai lead score',\n  tier:      'ai qualification',\n  reason:    'ai reason',\n  sourceRaw: 'lead source raw',\n  timestamp: 'intake timestamp',\n};\n\nconst fieldIds = {};\nconst missing = [];\nfor (const [key, name] of Object.entries(WANTED)) {\n  if (byName[name]) fieldIds[key] = byName[name];\n  else missing.push(name);\n}\n\n// Missing fields are reported, not fatal. The contact is still created, it\n// just carries less enrichment.\nreturn [{ json: { ...upstream, fieldIds, missingFields: missing } }];"
+      },
+      "id": "n06",
+      "name": "Build Field Map",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/contacts/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ locationId: $env.GHL_LOCATION_ID, pageLimit: 1, filters: [{ field: \"email\", operator: \"eq\", value: $json.lead.email }] }) }}",
+        "options": {}
+      },
+      "id": "n07",
+      "name": "GHL: Find Existing Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GHL_PIT",
+          "name": "GHL Private Integration Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the request body here rather than in the HTTP node. Lead text is\n// user-supplied, and interpolating it into the node's JSON field would let a\n// quote break the payload. Building an object and stringifying it will not.\nconst ctx = $('Build Field Map').first().json;\nconst lead = ctx.lead;\n\nconst search = $input.first().json;\nconst existing = (search.contacts ?? [])[0] ?? null;\n\nconst facts = [\n  `Name: ${[lead.firstName, lead.lastName].filter(Boolean).join(' ') || 'not given'}`,\n  `Email: ${lead.email}`,\n  `Phone: ${lead.phone || 'not given'}`,\n  `Company: ${lead.company || 'not given'}`,\n  `Website: ${lead.website || 'not given'}`,\n  `Stated budget: ${lead.budget || 'not given'}`,\n  `Source: ${lead.source}`,\n  `Returning contact: ${existing ? 'yes, already in the CRM' : 'no, first contact'}`,\n  `Message: ${lead.message || 'none supplied'}`,\n].join('\\n');\n\nconst claudeBody = {\n  model: 'claude-sonnet-5',\n  max_tokens: 512,\n  // Forcing the tool guarantees a parseable result. Prompting for \"JSON only\"\n  // does not, and it fails intermittently rather than obviously.\n  tool_choice: { type: 'tool', name: 'record_qualification' },\n  tools: [{\n    name: 'record_qualification',\n    description: 'Record the qualification verdict for one inbound sales lead.',\n    input_schema: {\n      type: 'object',\n      properties: {\n        score: {\n          type: 'integer',\n          description: 'Buying intent from 0 to 100.',\n        },\n        tier: {\n          type: 'string',\n          enum: ['Hot', 'Warm', 'Cold'],\n          description: 'Hot: clear need and budget signal. Warm: real interest, detail missing. Cold: vague, off-topic or likely spam.',\n        },\n        reason: {\n          type: 'string',\n          description: 'One or two sentences a salesperson can read before calling. Cite what in the lead drove the verdict.',\n        },\n        suggested_action: {\n          type: 'string',\n          description: 'The single next step for the rep.',\n        },\n      },\n      required: ['score', 'tier', 'reason', 'suggested_action'],\n    },\n  }],\n  messages: [{\n    role: 'user',\n    content:\n      'You are qualifying an inbound lead for a B2B services business. ' +\n      'Judge only what is here; do not invent context. A sparse enquiry from a ' +\n      'real company outranks a long message with no company behind it.\\n\\n' +\n      '<lead>\\n' + facts + '\\n</lead>',\n  }],\n};\n\nreturn [{\n  json: {\n    ...ctx,\n    existingContactId: existing ? existing.id : null,\n    isDuplicate: Boolean(existing),\n    claudeBody,\n  },\n}];"
+      },
+      "id": "n08",
+      "name": "Prepare Qualification Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.claudeBody) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "n09",
+      "name": "Claude: Qualify Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1160,
+        200
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ANTHROPIC_KEY",
+          "name": "Anthropic API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Prepare Qualification Prompt').first().json;\nconst res = $input.first().json;\n\nconst block = (res.content ?? []).find((c) => c.type === 'tool_use');\nif (!block || !block.input) {\n  throw new Error('Claude returned no qualification tool call: ' + JSON.stringify(res).slice(0, 400));\n}\n\nconst q = block.input;\nconst tiers = ['Hot', 'Warm', 'Cold'];\n\n// Clamp regardless of the schema, in case the value comes back out of range.\nconst score = Math.max(0, Math.min(100, Number(q.score) || 0));\nconst tier = tiers.includes(q.tier) ? q.tier : (score >= 70 ? 'Hot' : score >= 40 ? 'Warm' : 'Cold');\n\nconst lead = ctx.lead;\nconst fieldIds = ctx.fieldIds ?? {};\n\nconst customFields = [];\nconst put = (key, value) => {\n  if (fieldIds[key] && value !== '' && value != null) {\n    customFields.push({ id: fieldIds[key], value: String(value) });\n  }\n};\nput('score', score);\nput('tier', tier);\nput('reason', q.reason ?? '');\nput('sourceRaw', lead.source);\nput('timestamp', ctx.receivedAt);\n\nconst contact = {\n  locationId: $env.GHL_LOCATION_ID,\n  email: lead.email,\n  source: lead.source,\n  tags: ['inbound-lead', `ai-${tier.toLowerCase()}`],\n  customFields,\n};\nif (lead.firstName) contact.firstName = lead.firstName;\nif (lead.lastName) contact.lastName = lead.lastName;\nif (lead.phone) contact.phone = lead.phone;\nif (lead.company) contact.companyName = lead.company;\n\nreturn [{\n  json: {\n    ...ctx,\n    qualification: { score, tier, reason: q.reason ?? '', suggestedAction: q.suggested_action ?? '' },\n    contact,\n  },\n}];"
+      },
+      "id": "n10",
+      "name": "Parse Qualification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/contacts/upsert",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.contact) }}",
+        "options": {}
+      },
+      "id": "n11",
+      "name": "GHL: Upsert Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1600,
+        200
+      ],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GHL_PIT",
+          "name": "GHL Private Integration Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Parse Qualification').first().json;\nconst upsert = $input.first().json;\n\nconst contactId = upsert.contact?.id ?? upsert.id ?? ctx.existingContactId;\nif (!contactId) {\n  throw new Error('CRM upsert returned no contact id: ' + JSON.stringify(upsert).slice(0, 400));\n}\n\nconst lead = ctx.lead;\nconst q = ctx.qualification;\nconst greeting = lead.firstName ? `Hi ${lead.firstName},` : 'Hi,';\n\nconst html = [\n  `<p>${greeting}</p>`,\n  '<p>Thanks for getting in touch. Your enquiry has landed with us and someone will come back to you shortly.</p>',\n  lead.message ? `<p>For your records, this is what you sent:</p><blockquote>${lead.message.replace(/</g, '&lt;')}</blockquote>` : '',\n  '<p>Best,<br/>The team</p>',\n].filter(Boolean).join('\\n');\n\nreturn [{\n  json: {\n    ...ctx,\n    contactId,\n    emailBody: {\n      type: 'Email',\n      contactId,\n      subject: 'We received your enquiry',\n      html,\n    },\n    opportunityBody: {\n      locationId: $env.GHL_LOCATION_ID,\n      pipelineId: $env.GHL_PIPELINE_ID,\n      contactId,\n      name: `${lead.company || [lead.firstName, lead.lastName].filter(Boolean).join(' ') || lead.email} - inbound`,\n      status: 'open',\n      monetaryValue: 0,\n    },\n    telegramText: [\n      `<b>New ${q.tier.toUpperCase()} lead</b> (score ${q.score}/100)`,\n      '',\n      `<b>${[lead.firstName, lead.lastName].filter(Boolean).join(' ') || 'Name not given'}</b>`,\n      lead.company ? `Company: ${lead.company}` : '',\n      `Email: ${lead.email}`,\n      lead.phone ? `Phone: ${lead.phone}` : '',\n      '',\n      `<i>${q.reason}</i>`,\n      '',\n      `Next step: ${q.suggestedAction}`,\n      ctx.isDuplicate ? '\\n(returning contact, record updated not duplicated)' : '',\n    ].filter(Boolean).join('\\n'),\n  },\n}];"
+      },
+      "id": "n12",
+      "name": "Build CRM Payloads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/opportunities/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.opportunityBody) }}",
+        "options": {}
+      },
+      "id": "n13",
+      "name": "GHL: Create Opportunity",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2040,
+        120
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GHL_PIT",
+          "name": "GHL Private Integration Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/conversations/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build CRM Payloads').first().json.emailBody) }}",
+        "options": {}
+      },
+      "id": "n14",
+      "name": "GHL: Send Follow-Up Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2260,
+        120
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "GHL_PIT",
+          "name": "GHL Private Integration Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $('Build CRM Payloads').first().json.telegramText }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "n15",
+      "name": "Notify Sales Team",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2480,
+        120
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_BOT",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, contactId: $('Build CRM Payloads').first().json.contactId, tier: $('Parse Qualification').first().json.qualification.tier, score: $('Parse Qualification').first().json.qualification.score, duplicate: $('Parse Qualification').first().json.isDuplicate }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "n16",
+      "name": "Respond: 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2700,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Reached when the CRM write fails. The lead is already validated and scored,\n// so it is sent on to Telegram rather than dropped.\nconst err = $input.first().json;\nconst ctx = $('Parse Qualification').first().json;\n\nreturn [{\n  json: {\n    lead: ctx.lead,\n    qualification: ctx.qualification,\n    error: err.error?.message ?? err.message ?? JSON.stringify(err).slice(0, 300),\n    telegramText: [\n      '<b>LEAD CAPTURE FAILED</b>',\n      '',\n      `The CRM write did not go through for <b>${ctx.lead.email}</b>.`,\n      'The lead is in this message so it is not lost. Add it by hand.',\n      '',\n      `Name: ${[ctx.lead.firstName, ctx.lead.lastName].filter(Boolean).join(' ') || 'not given'}`,\n      `Company: ${ctx.lead.company || 'not given'}`,\n      `Phone: ${ctx.lead.phone || 'not given'}`,\n      `Message: ${ctx.lead.message || 'none'}`,\n      '',\n      `Error: ${err.error?.message ?? err.message ?? 'unknown'}`,\n    ].join('\\n'),\n  },\n}];"
+      },
+      "id": "n17",
+      "name": "Handle CRM Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.telegramText }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "n18",
+      "name": "Alert: Lead At Risk",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2040,
+        380
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_BOT",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, error: \"crm_write_failed\", captured: true }) }}",
+        "options": {
+          "responseCode": 502
+        }
+      },
+      "id": "n19",
+      "name": "Respond: 502 Captured",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2260,
+        380
+      ]
+    }
+  ],
+  "connections": {
+    "Lead Intake Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate & Normalise",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Normalise": {
+      "main": [
+        [
+          {
+            "node": "Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "GHL: Read Custom Fields",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: 400 Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Read Custom Fields": {
+      "main": [
+        [
+          {
+            "node": "Build Field Map",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Field Map": {
+      "main": [
+        [
+          {
+            "node": "GHL: Find Existing Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Find Existing Contact": {
+      "main": [
+        [
+          {
+            "node": "Prepare Qualification Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Qualification Prompt": {
+      "main": [
+        [
+          {
+            "node": "Claude: Qualify Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude: Qualify Lead": {
+      "main": [
+        [
+          {
+            "node": "Parse Qualification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Qualification": {
+      "main": [
+        [
+          {
+            "node": "GHL: Upsert Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Upsert Contact": {
+      "main": [
+        [
+          {
+            "node": "Build CRM Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle CRM Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build CRM Payloads": {
+      "main": [
+        [
+          {
+            "node": "GHL: Create Opportunity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Create Opportunity": {
+      "main": [
+        [
+          {
+            "node": "GHL: Send Follow-Up Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL: Send Follow-Up Email": {
+      "main": [
+        [
+          {
+            "node": "Notify Sales Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Sales Team": {
+      "main": [
+        [
+          {
+            "node": "Respond: 200 OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle CRM Failure": {
+      "main": [
+        [
+          {
+            "node": "Alert: Lead At Risk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert: Lead At Risk": {
+      "main": [
+        [
+          {
+            "node": "Respond: 502 Captured",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "portfolio"
+  },
+  "tags": []
+}
